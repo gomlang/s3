@@ -1,0 +1,451 @@
+package tests;
+
+use ecosystem::s3;
+use ecosystem::request;
+use std::bytes::{Bytes};
+use std::context;
+use std::context::{Context};
+use std::fs;
+use std::process::{Command};
+use std::panic;
+use std::task;
+use std::testing;
+use std::time;
+use std::time::{Duration, SystemTime};
+
+fn with_fixture(body: (string) -> ()) -> () {
+    testing::expect_ok(fs::create_dir_all("_artifact"), "artifact directory");
+    let port_file = "_artifact/s3-fixture-" + SystemTime::now().unix_nanoseconds().to_string();
+    defer {
+        let _ = fs::remove_file(port_file);
+    };
+    task::scope(
+        |scope| {
+            let child = scope.spawn(
+                |cancel| Command::new("python3").arg("tools/s3_fixture.py").arg(port_file).output_cancel_structured(
+                    cancel,
+                ),
+            );
+            defer scope.cancel();
+            let mut endpoint = "";
+            for _ in 0..250 {
+                match fs::read_file_structured(port_file) {
+                    Ok(value) => {
+                        endpoint = value;
+                        break;
+                    },
+                    Err(_) => time::sleep(Duration::from_milliseconds(20)),
+                }
+            }
+            testing::assert(endpoint != "");
+            body(endpoint);
+            scope.cancel();
+            let _ = child.join();
+        },
+    );
+}
+
+fn fixture_client(endpoint: string, max_bytes: isize) -> s3::Client {
+    let temporary = testing::expect_ok(
+        credentials().with_session_token("session+/="),
+        "temporary credentials",
+    );
+    let config = s3::Config {
+        allow_http: true,
+        clock: || "20130524T000000Z",
+        max_object_bytes: max_bytes,
+        ..s3::Config::endpoint(endpoint, "us-east-1"),
+    };
+    testing::expect_ok(s3::Client::new(config, temporary), "S3 fixture client")
+}
+
+#[test]
+fn real_http_signed_crud_presigned_and_paginated_requests() -> () {
+    with_fixture(
+        |endpoint| {
+            let client = fixture_client(endpoint, 8388608);
+            defer client.close();
+            let context = Context::background();
+            let key = "dir/../雪 //x%+?";
+            testing::assert(
+                testing::expect_ok(
+                    client.put_object(
+                        context,
+                        "bucket",
+                        key,
+                        Bytes::from_string("payload"),
+                        "text/plain",
+                    ),
+                    "put",
+                )
+                    == Option::Some("\"stored\""),
+            );
+            let object = testing::expect_ok(client.get_object(context, "bucket", key), "get");
+            testing::assert(object.body.to_vec() == "payload".to_bytes());
+            testing::assert(object.version_id == Option::Some("v1"));
+            let metadata = testing::expect_ok(client.head_object(context, "bucket", key), "head");
+            testing::assert_eq(metadata.size, 7);
+            let presigned = testing::expect_ok(
+                client.presign(context, "GET", "bucket", key, 30),
+                "presigned",
+            );
+            let http = testing::expect_ok(request::Client::new(), "HTTP client");
+            defer http.close();
+            let result = testing::expect_ok(http.get(presigned).send(), "presigned transport");
+            testing::assert_eq(result.status().as_isize(), 200);
+            testing::assert_eq(testing::expect_ok(result.text(), "presigned text"), "payload");
+            let page = testing::expect_ok(
+                client.list_objects(context, "bucket", s3::ListOptions::new()),
+                "first page",
+            );
+            testing::assert_eq(page.objects[0].key, "dir/雪 +%.txt");
+            testing::assert_eq(page.common_prefixes[0], "dir/");
+            testing::assert(page.next_token == Option::Some("next+/=& token"));
+            let keys: Vec[string] = Vec::new();
+            let pages = testing::expect_ok(
+                client.list_pages(
+                    context,
+                    "bucket",
+                    s3::ListOptions::new(),
+                    10,
+                    |page| {
+                        for object in page.objects {
+                            keys.push(object.key);
+                        }
+                        Result::Ok(true)
+                    },
+                ),
+                "all pages",
+            );
+            testing::assert_eq(pages, 2);
+            testing::assert_eq(keys.len(), 2);
+            testing::expect_ok(client.delete_object(context, "bucket", key), "delete");
+            let missing = testing::expect_err(
+                client.get_object(context, "bucket", "missing"),
+                "missing",
+            );
+            testing::assert_eq(missing.status, 404);
+            testing::assert_eq(missing.code, "NoSuchKey");
+            testing::assert(!missing.debug().contains("wJalr"));
+            testing::assert(!missing.debug().contains("session"));
+            let echoed = testing::expect_err(
+                client.get_object(context, "bucket", "echo"),
+                "echoed secret",
+            );
+            testing::assert_eq(echoed.code, "UnknownServiceError");
+            testing::assert(!echoed.debug().contains("AKIAIOS"));
+            testing::assert(!echoed.debug().contains("wJalr"));
+            let redirected = testing::expect_err(
+                client.get_object(context, "bucket", "redirect"),
+                "redirect disabled",
+            );
+            testing::assert_eq(redirected.status, 307);
+            let stats = testing::expect_ok(
+                testing::expect_ok(http.get(endpoint + "/stats").send(), "stats").text(),
+                "stats text",
+            );
+            testing::assert(stats.contains("\"redirected\": 0"));
+        },
+    );
+}
+
+#[test]
+fn multipart_stream_completion_failure_abort_and_validation() -> () {
+    with_fixture(
+        |endpoint| {
+            let client = fixture_client(endpoint, 8388608);
+            defer client.close();
+            let context = Context::background();
+            let upload = testing::expect_ok(
+                client.create_multipart(context, "bucket", "multipart", "application/octet-stream"),
+                "create",
+            );
+            let part = testing::expect_ok(
+                upload.upload_part(context, 1, Bytes::from_string("tiny last part")),
+                "part",
+            );
+            testing::assert_err(upload.complete(context, Vec::from_array([part, part])));
+            testing::assert_eq(
+                testing::expect_ok(upload.complete(context, Vec::from_array([part])), "complete"),
+                "\"complete\"",
+            );
+            testing::assert_eq(
+                testing::expect_ok(
+                    client.get_object(context, "bucket", "multipart"),
+                    "completed object",
+                ).body.len(),
+                14,
+            );
+            let pieces = Vec::from_array([Bytes::from_string("small last part")]);
+            let success = testing::expect_ok(
+                client.upload_multipart(
+                    context,
+                    "bucket",
+                    "stream",
+                    "text/plain",
+                    5242880,
+                    || Result::Ok(pieces.pop()),
+                ),
+                "stream",
+            );
+            testing::assert_eq(success, "\"complete\"");
+            let pieces = Vec::from_array(
+                [Bytes::from_string("tail"), Bytes::from_string("x".repeat(5242880))],
+            );
+            testing::expect_ok(
+                client.upload_multipart(
+                    context,
+                    "bucket",
+                    "two-parts",
+                    "application/octet-stream",
+                    5242880,
+                    || Result::Ok(pieces.pop()),
+                ),
+                "two part upload",
+            );
+            testing::assert_eq(
+                testing::expect_ok(
+                    client.head_object(context, "bucket", "two-parts"),
+                    "multipart head",
+                ).size,
+                5242884,
+            );
+            for key in Vec::from_array(["failpart", "failcomplete"]) {
+                let pieces = Vec::from_array([Bytes::from_string("small last part")]);
+                let failure = testing::expect_err(
+                    client.upload_multipart(
+                        context,
+                        "bucket",
+                        key,
+                        "text/plain",
+                        5242880,
+                        || Result::Ok(pieces.pop()),
+                    ),
+                    "failure cleanup",
+                );
+                testing::assert_eq(failure.kind, s3::ErrorKind::Service);
+                testing::assert(!failure.cleanup_failed);
+            }
+            let pieces = Vec::from_array([Bytes::from_string("short"), Bytes::from_string("short")]);
+            let failure = testing::expect_err(
+                client.upload_multipart(
+                    context,
+                    "bucket",
+                    "badchunks",
+                    "text/plain",
+                    5242880,
+                    || Result::Ok(pieces.pop()),
+                ),
+                "short nonfinal",
+            );
+            testing::assert_eq(failure.kind, s3::ErrorKind::Configuration);
+            let pieces = Vec::from_array([Bytes::from_string("failure")]);
+            let failed_abort = testing::expect_err(
+                client.upload_multipart(
+                    context,
+                    "bucket",
+                    "abortfail",
+                    "text/plain",
+                    5242880,
+                    || Result::Ok(pieces.pop()),
+                ),
+                "abort failed",
+            );
+            testing::assert(failed_abort.cleanup_failed);
+            let panicked = panic::catch(
+                || client.upload_multipart(
+                    context,
+                    "bucket",
+                    "panic",
+                    "text/plain",
+                    5242880,
+                    || panic::raise("callback panic"),
+                ),
+            );
+            testing::assert_eq(
+                testing::expect_err(panicked, "callback panic propagated").message(),
+                "callback panic",
+            );
+            context::with_cancel(
+                context,
+                |cancelled, handle| {
+                    let pieces = Vec::from_array([Bytes::from_string("cancelled part")]);
+                    let failure = testing::expect_err(
+                        client.upload_multipart(
+                            cancelled,
+                            "bucket",
+                            "cancelled",
+                            "text/plain",
+                            5242880,
+                            || {
+                                handle.cancel();
+                                Result::Ok(pieces.pop())
+                            },
+                        ),
+                        "cancelled upload",
+                    );
+                    testing::assert_eq(failure.kind, s3::ErrorKind::Cancelled);
+                    testing::assert(!failure.cleanup_failed);
+                },
+            );
+            let http = testing::expect_ok(request::Client::new(), "HTTP");
+            defer http.close();
+            let stats = testing::expect_ok(
+                testing::expect_ok(http.get(endpoint + "/stats").send(), "stats").text(),
+                "stats text",
+            );
+            testing::assert(stats.contains("\"aborted\": 5"));
+        },
+    );
+}
+
+#[test]
+fn cancellation_limits_and_malformed_xml_are_recoverable() -> () {
+    with_fixture(
+        |endpoint| {
+            let client = fixture_client(endpoint, 1024);
+            defer client.close();
+            let context = Context::background();
+            testing::assert_eq(
+                testing::expect_err(client.get_object(context, "bucket", "huge"), "body limit").kind,
+                s3::ErrorKind::Limit,
+            );
+            for prefix in Vec::from_array(["malformed", "dtd", "overflow"]) {
+                testing::assert_eq(
+                    testing::expect_err(
+                        client.list_objects(
+                            context,
+                            "bucket",
+                            s3::ListOptions { prefix, ..s3::ListOptions::new() },
+                        ),
+                        "invalid XML",
+                    ).kind,
+                    s3::ErrorKind::Protocol,
+                );
+            }
+            testing::assert_eq(
+                testing::expect_err(
+                    client.list_pages(
+                        context,
+                        "bucket",
+                        s3::ListOptions { prefix: "cycle", ..s3::ListOptions::new() },
+                        10,
+                        |_| Result::Ok(true),
+                    ),
+                    "multi-step token cycle",
+                ).kind,
+                s3::ErrorKind::Protocol,
+            );
+            let calls = Ref::new(0);
+            testing::assert_eq(
+                testing::expect_ok(
+                    client.list_pages(
+                        context,
+                        "bucket",
+                        s3::ListOptions::new(),
+                        10,
+                        |_| {
+                            calls.set(calls.get() + 1);
+                            Result::Ok(false)
+                        },
+                    ),
+                    "early stop",
+                ),
+                1,
+            );
+            testing::assert_eq(calls.get(), 1);
+            testing::assert_eq(
+                testing::expect_err(
+                    client.list_pages(
+                        context,
+                        "bucket",
+                        s3::ListOptions { prefix: "repeat", ..s3::ListOptions::new() },
+                        10,
+                        |_| Result::Ok(true),
+                    ),
+                    "repeated page token",
+                ).kind,
+                s3::ErrorKind::Protocol,
+            );
+            testing::assert_eq(
+                testing::expect_err(
+                    client.list_pages(
+                        context,
+                        "bucket",
+                        s3::ListOptions::new(),
+                        1,
+                        |_| Result::Ok(true),
+                    ),
+                    "page limit",
+                ).kind,
+                s3::ErrorKind::Limit,
+            );
+            context::with_cancel(
+                context,
+                |cancelled, handle| {
+                    handle.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(
+                            client.get_object(cancelled, "bucket", "slow"),
+                            "pre-cancelled",
+                        ).kind,
+                        s3::ErrorKind::Cancelled,
+                    );
+                },
+            );
+            context::with_timeout(
+                context,
+                Duration::from_milliseconds(50),
+                |deadline, _| {
+                    testing::assert_err(client.get_object(deadline, "bucket", "slow"));
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn completion_metadata_bound_counts_the_closing_element() -> () {
+    with_fixture(
+        |endpoint| {
+            for budget in 110..112 {
+                let config = s3::Config {
+                    allow_http: true,
+                    clock: || "20130524T000000Z",
+                    max_metadata_bytes: budget,
+                    ..s3::Config::endpoint(endpoint, "us-east-1"),
+                };
+                let client = testing::expect_ok(
+                    s3::Client::new(
+                        config,
+                        testing::expect_ok(
+                            credentials().with_session_token("session+/="),
+                            "temporary",
+                        ),
+                    ),
+                    "client",
+                );
+                defer client.close();
+                let context = Context::background();
+                let upload = testing::expect_ok(
+                    client.create_multipart(context, "bucket", "metadata-bound", "text/plain"),
+                    "initiate",
+                );
+                let part = testing::expect_ok(
+                    upload.upload_part(context, 1, Bytes::from_string("part")),
+                    "part",
+                );
+                let result = upload.complete(context, Vec::from_array([part]));
+                if budget == 110 {
+                    testing::assert_eq(
+                        testing::expect_err(result, "metadata exact limit").kind,
+                        s3::ErrorKind::Limit,
+                    );
+                    testing::expect_ok(upload.abort(context), "cleanup");
+                } else {
+                    testing::expect_ok(result, "exact metadata length accepted");
+                }
+            }
+        },
+    );
+}

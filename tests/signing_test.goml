@@ -1,0 +1,222 @@
+package tests;
+
+use ecosystem::s3;
+use ecosystem::request::{Headers};
+use std::testing;
+use std::bytes::{Bytes};
+use std::crypto::hash;
+use std::context::{Context};
+use std::context;
+
+fn credentials() -> s3::Credentials {
+    testing::expect_ok(
+        s3::Credentials::new("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+        "credentials",
+    )
+}
+
+fn input() -> s3::SigningRequest {
+    s3::SigningRequest {
+        method: "GET",
+        host: "examplebucket.s3.amazonaws.com",
+        path: "/test.txt",
+        query: Vec::new(),
+        headers: Headers::new(),
+        payload_hash: hash::sha256(Bytes::new()),
+        timestamp: "20130524T000000Z",
+        region: "us-east-1",
+    }
+}
+
+#[test]
+fn aws_published_get_put_lifecycle_and_list_vectors() -> () {
+    let get = s3::SigningRequest {
+        headers: testing::expect_ok(Headers::new().insert("Range", "bytes=0-9"), "range"),
+        ..input(),
+    };
+    let signed = testing::expect_ok(s3::sign(get, credentials()), "AWS GET");
+    testing::assert_eq(
+        signed.signature,
+        "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41",
+    );
+    testing::assert_eq(
+        hash::sha256(Bytes::from_string(signed.canonical_request)),
+        "7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972",
+    );
+    let headers = testing::expect_ok(
+        Headers::new().insert("Date", "Fri, 24 May 2013 00:00:00 GMT"),
+        "date",
+    );
+    let headers = testing::expect_ok(
+        headers.insert("x-amz-storage-class", "REDUCED_REDUNDANCY"),
+        "class",
+    );
+    let put = s3::SigningRequest {
+        method: "PUT",
+        path: "/test$file.text",
+        headers,
+        payload_hash: hash::sha256(Bytes::from_string("Welcome to Amazon S3.")),
+        ..input(),
+    };
+    testing::assert_eq(
+        testing::expect_ok(s3::sign(put, credentials()), "AWS PUT").signature,
+        "98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd",
+    );
+    let lifecycle = s3::SigningRequest {
+        path: "/",
+        query: Vec::from_array([("lifecycle", "")]),
+        ..input(),
+    };
+    testing::assert_eq(
+        testing::expect_ok(s3::sign(lifecycle, credentials()), "AWS lifecycle").signature,
+        "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543",
+    );
+    let listing = s3::SigningRequest {
+        path: "/",
+        query: Vec::from_array([("prefix", "J"), ("max-keys", "2")]),
+        ..input(),
+    };
+    testing::assert_eq(
+        testing::expect_ok(s3::sign(listing, credentials()), "AWS list").signature,
+        "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7",
+    );
+}
+
+#[test]
+fn aws_published_presigned_vector_and_session_token() -> () {
+    let query = testing::expect_ok(s3::presign_query(input(), credentials(), 86400), "AWS presign");
+    testing::assert(
+        query.ends_with(
+            "X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+        ),
+    );
+    let temporary = testing::expect_ok(credentials().with_session_token("session+/="), "session");
+    let signed = testing::expect_ok(s3::sign(input(), temporary), "temporary sign");
+    testing::assert(signed.signed_headers.contains("x-amz-security-token"));
+    testing::assert(signed.headers.get("x-amz-security-token") == Option::Some("session+/="));
+    let query = testing::expect_ok(s3::presign_query(input(), temporary, 1), "temporary presign");
+    testing::assert(query.contains("X-Amz-Security-Token=session%2B%2F%3D"));
+}
+
+#[test]
+fn canonical_encoding_duplicates_whitespace_and_literal_percent() -> () {
+    testing::assert_eq(s3::uri_encode("/a//./../%2f/雪 +", true), "/a//./../%252f/%E9%9B%AA%20%2B");
+    testing::assert_eq(
+        s3::canonical_query(
+            Vec::from_array([("z", ""), ("a", "b"), ("a", " a"), ("é", "+"), ("a", "a")]),
+        ),
+        "%C3%A9=%2B&a=%20a&a=a&a=b&z=",
+    );
+    let headers = testing::expect_ok(Headers::new().append("X-Test", "  a\t b "), "header");
+    let headers = testing::expect_ok(headers.append("x-test", " c  d"), "header");
+    let signed = testing::expect_ok(
+        s3::sign(s3::SigningRequest { headers, ..input() }, credentials()),
+        "normalize",
+    );
+    testing::assert(signed.canonical_request.contains("x-test:a b,c d\n"));
+}
+
+#[test]
+fn signing_and_client_configuration_fail_closed() -> () {
+    testing::assert_err(s3::presign_query(input(), credentials(), 0));
+    testing::assert_err(s3::presign_query(input(), credentials(), 604801));
+    testing::assert_err(
+        s3::sign(s3::SigningRequest { timestamp: "20130230T000000Z", ..input() }, credentials()),
+    );
+    testing::assert_err(
+        s3::sign(s3::SigningRequest { region: "us-east-1/other", ..input() }, credentials()),
+    );
+    testing::assert_err(
+        s3::presign_query(
+            s3::SigningRequest {
+                query: Vec::from_array([("x-amz-signature", "collision")]),
+                ..input(),
+            },
+            credentials(),
+            30,
+        ),
+    );
+    testing::assert_err(s3::Credentials::new("bad/key", "secret"));
+    testing::assert_err(credentials().with_session_token("bad\r\nvalue"));
+    testing::assert_eq(credentials().debug(), "Credentials([REDACTED])");
+    testing::assert_err(
+        s3::Client::new(s3::Config::endpoint("http://localhost:9000", "us-east-1"), credentials()),
+    );
+    testing::assert_err(
+        s3::Client::new(s3::Config::endpoint("https://localhost/a", "us-east-1"), credentials()),
+    );
+    testing::assert_err(
+        s3::Client::new(
+            s3::Config::endpoint("https://localhost/#secret", "us-east-1"),
+            credentials(),
+        ),
+    );
+    let client = testing::expect_ok(
+        s3::Client::new(
+            s3::Config { clock: || "20130524T000000Z", ..s3::Config::aws("us-east-1") },
+            credentials(),
+        ),
+        "client",
+    );
+    defer client.close();
+    testing::assert_err(client.presign(Context::background(), "GET", "bad/bucket", "key", 60));
+    testing::assert_err(client.presign(Context::background(), "GET", "dotted.bucket", "key", 60));
+    let url = testing::expect_ok(
+        client.presign(Context::background(), "PUT", "bucket", "../a//%", 60),
+        "presign",
+    );
+    testing::assert(url.starts_with("https://bucket.s3.us-east-1.amazonaws.com/../a//%25?"));
+}
+
+#[test]
+fn credential_provider_refreshes_and_its_errors_are_redacted() -> () {
+    let calls = Ref::new(0);
+    let client = testing::expect_ok(
+        s3::Client::with_provider(
+            s3::Config::aws("us-east-1"),
+            |_| {
+                calls.set(calls.get() + 1);
+                Result::Ok(credentials())
+            },
+        ),
+        "provider client",
+    );
+    defer client.close();
+    for _ in 0..2 {
+        testing::expect_ok(
+            client.presign(Context::background(), "GET", "bucket", "key", 30),
+            "presign",
+        );
+    }
+    testing::assert_eq(calls.get(), 2);
+    context::with_cancel(
+        Context::background(),
+        |cancelled, handle| {
+            handle.cancel();
+            testing::assert_err(client.presign(cancelled, "GET", "bucket", "key", 30));
+        },
+    );
+    testing::assert_eq(calls.get(), 2);
+    let failed = testing::expect_ok(
+        s3::Client::with_provider(
+            s3::Config::aws("us-east-1"),
+            |_| Result::Err(
+                s3::Error {
+                    kind: s3::ErrorKind::Credentials,
+                    message: "secret-provider-value",
+                    status: 0,
+                    code: "secret-provider-value",
+                    cleanup_failed: false,
+                },
+            ),
+        ),
+        "failed provider client",
+    );
+    defer failed.close();
+    let error = testing::expect_err(
+        failed.presign(Context::background(), "GET", "bucket", "key", 30),
+        "provider error",
+    );
+    testing::assert_eq(error.kind, s3::ErrorKind::Credentials);
+    testing::assert(!error.debug().contains("secret-provider-value"));
+}

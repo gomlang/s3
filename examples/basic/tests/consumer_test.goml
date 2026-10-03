@@ -1,0 +1,8 @@
+package tests;
+
+use ecosystem::s3::examples::basic;
+
+#[test]
+fn presigned_consumer() -> () {
+    basic::exercise();
+}
