@@ -1,0 +1,31 @@
+package main;
+
+use ecosystem::s3;
+use std::context::{Context};
+use std::testing;
+
+pub fn exercise() -> () {
+    let credentials = testing::expect_ok(
+        s3::Credentials::new("EXAMPLEACCESSKEY", "example-only-secret"),
+        "credentials",
+    );
+    let config = s3::Config { clock: || "20260102T030405Z", ..s3::Config::aws("us-east-1") };
+    let client = testing::expect_ok(s3::Client::new(config, credentials), "client");
+    defer client.close();
+    let url = testing::expect_ok(
+        client.presign(Context::background(), "GET", "example-bucket", "reports/雪 2026.csv", 300),
+        "presign",
+    );
+    testing::assert(
+        url.starts_with(
+            "https://example-bucket.s3.us-east-1.amazonaws.com/reports/%E9%9B%AA%202026.csv?",
+        ),
+    );
+    testing::assert(url.contains("X-Amz-Expires=300"));
+    testing::assert(!url.contains("example-only-secret"));
+}
+
+fn main() -> () {
+    exercise();
+    println("s3 consumer: ok");
+}

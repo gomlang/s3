@@ -1,0 +1,320 @@
+package s3;
+
+use ecosystem::datetime;
+use ecosystem::request::{Headers};
+use std::bytes::{Bytes};
+use std::crypto::hash;
+use std::crypto::hmac;
+use std::encoding::hex;
+
+fn current_timestamp() -> string {
+    datetime::UtcInstant::now().to_utc().format("%Y%m%dT%H%M%SZ").unwrap_or("")
+}
+
+fn validate_timestamp(value: string) -> Result[(), Error] {
+    if value.byte_len() != 16 || value.byte_get(8) != b'T' || value.byte_get(15) != b'Z' {
+        return Result::Err(error(ErrorKind::Configuration, "invalid signing timestamp"))
+    }
+    let text = value.byte_slice(0, 4) + "-" + value.byte_slice(4, 6) + "-" + value.byte_slice(6, 8)
+        + "T"
+        + value.byte_slice(9, 11)
+        + ":"
+        + value.byte_slice(11, 13)
+        + ":"
+        + value.byte_slice(13, 15);
+    datetime::LocalDateTime::parse(text).map_err(
+        |_| error(ErrorKind::Configuration, "invalid signing timestamp"),
+    )?;
+    Result::Ok(())
+}
+
+fn validate_region(value: string) -> Result[(), Error] {
+    if value.byte_len() < 1 || value.byte_len() > 64 {
+        return Result::Err(error(ErrorKind::Configuration, "invalid region"))
+    }
+    for byte in value.to_bytes() {
+        if !(byte >= b'a' && byte <= b'z' || byte >= b'0' && byte <= b'9' || byte == b'-') {
+            return Result::Err(error(ErrorKind::Configuration, "invalid region"))
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn uri_encode(value: string, preserve_slashes: bool) -> string {
+    let output: Vec[byte] = Vec::new();
+    let digits = b"0123456789ABCDEF";
+    for byte in value.to_bytes() {
+        if byte >= b'A' && byte <= b'Z' || byte >= b'a' && byte <= b'z'
+            || byte >= b'0' && byte <= b'9'
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~'
+            || preserve_slashes && byte == b'/' {
+            output.push(byte);
+        } else {
+            output.push(b'%');
+            output.push(digits[(byte / 16).to_isize()]);
+            output.push(digits[(byte % 16).to_isize()]);
+        }
+    }
+    string_from_utf8(output).1
+}
+
+pub fn canonical_query(pairs: Vec[(string, string)]) -> string {
+    let encoded: Vec[(string, string)] = Vec::new();
+    for (name, value) in pairs {
+        encoded.push((uri_encode(name, false), uri_encode(value, false)));
+    }
+    encoded.sort_by(
+        |left, right| {
+            if left.0 < right.0 || left.0 == right.0 && left.1 < right.1 {
+                -1
+            } else if left == right {
+                0
+            } else {
+                1
+            }
+        },
+    );
+    let output: Vec[string] = Vec::new();
+    for (name, value) in encoded {
+        output.push(name + "=" + value);
+    }
+    output.join("&")
+}
+
+fn normalize_header(value: string) -> string {
+    let output: Vec[byte] = Vec::new();
+    let mut space = false;
+    for byte in value.to_bytes() {
+        if byte == b' ' || byte == b'\t' {
+            space = output.len() > 0;
+        } else {
+            if space {
+                output.push(b' ');
+            }
+            output.push(byte);
+            space = false;
+        }
+    }
+    string_from_utf8(output).1
+}
+
+fn canonical_headers(headers: Headers) -> (string, string) {
+    let names: Vec[string] = Vec::new();
+    for (name, _) in headers.entries() {
+        if !names.contains(name) {
+            names.push(name);
+        }
+    }
+    names.sort_by(
+        |a, b| if a < b {
+            -1
+        } else if a == b {
+            0
+        } else {
+            1
+        },
+    );
+    let mut text = "";
+    for name in names {
+        let values: Vec[string] = Vec::new();
+        for value in headers.get_all(name) {
+            values.push(normalize_header(value));
+        }
+        text += name + ":" + values.join(",") + "\n";
+    };
+    (text, names.join(";"))
+}
+
+pub struct SigningRequest {
+    pub method: string,
+    pub host: string,
+    pub path: string,
+    pub query: Vec[(string, string)],
+    pub headers: Headers,
+    pub payload_hash: string,
+    pub timestamp: string,
+    pub region: string,
+}
+
+pub struct Signature {
+    pub headers: Headers,
+    pub signature: string,
+    pub signed_headers: string,
+    pub canonical_request: string,
+}
+
+fn signing_headers(input: SigningRequest, credentials: Credentials, presign: bool) -> Result[
+    Headers,
+    Error,
+] {
+    validate_timestamp(input.timestamp)?;
+    validate_region(input.region)?;
+    if input.path.byte_len() > 8192 || !input.path.starts_with("/") || input.host == ""
+        || input.query.len() > 1000
+        || input.headers.len() > 100 {
+        return Result::Err(error(ErrorKind::Configuration, "invalid signing request"))
+    }
+    let mut budget = 65536;
+    for (name, value) in input.query {
+        if name.byte_len() > budget {
+            return Result::Err(error(ErrorKind::Limit, "signing metadata limit exceeded"))
+        }
+        budget -= name.byte_len();
+        if value.byte_len() > budget {
+            return Result::Err(error(ErrorKind::Limit, "signing metadata limit exceeded"))
+        }
+        budget -= value.byte_len();
+    }
+    for (name, value) in input.headers.entries() {
+        if name.byte_len() > budget {
+            return Result::Err(error(ErrorKind::Limit, "signing metadata limit exceeded"))
+        }
+        budget -= name.byte_len();
+        if value.byte_len() > budget {
+            return Result::Err(error(ErrorKind::Limit, "signing metadata limit exceeded"))
+        }
+        budget -= value.byte_len();
+    }
+    if input.host.byte_len() > 1024 {
+        return Result::Err(error(ErrorKind::Configuration, "invalid signing host"))
+    }
+    for byte in input.method.to_bytes() {
+        if byte < b'A' || byte > b'Z' {
+            return Result::Err(error(ErrorKind::Configuration, "invalid signing method"))
+        }
+    }
+    if input.method == "" {
+        return Result::Err(error(ErrorKind::Configuration, "invalid signing method"))
+    }
+    if input.payload_hash != "UNSIGNED-PAYLOAD" {
+        if input.payload_hash.byte_len() != 64 {
+            return Result::Err(error(ErrorKind::Configuration, "invalid payload hash"))
+        }
+        for byte in input.payload_hash.to_bytes() {
+            if !(byte >= b'0' && byte <= b'9' || byte >= b'a' && byte <= b'f') {
+                return Result::Err(error(ErrorKind::Configuration, "invalid payload hash"))
+            }
+        }
+    }
+    let mut headers = input.headers.remove("authorization").remove("host").remove("x-amz-date").remove(
+        "x-amz-content-sha256",
+    ).remove("x-amz-security-token");
+    headers = headers.insert("host", input.host).map_err(
+        |_| error(ErrorKind::Configuration, "invalid signing host"),
+    )?;
+    if !presign {
+        headers = headers.insert("x-amz-date", input.timestamp).map_err(
+            |_| error(ErrorKind::Configuration, "invalid signing date"),
+        )?;
+        headers = headers.insert("x-amz-content-sha256", input.payload_hash).map_err(
+            |_| error(ErrorKind::Configuration, "invalid payload hash"),
+        )?;
+        if credentials.session_token != "" {
+            headers = headers.insert("x-amz-security-token", credentials.session_token).map_err(
+                |_| error(ErrorKind::Credentials, "invalid session token"),
+            )?;
+        }
+    }
+    Result::Ok(headers)
+}
+
+fn scope(input: SigningRequest) -> string {
+    input.timestamp.byte_slice(0, 8) + "/" + input.region + "/s3/aws4_request"
+}
+
+fn mac(key: Bytes, value: string) -> Result[Bytes, Error] {
+    hmac::sum(|| hash::Sha256Digest::new256(), key.as_slice(), value.to_bytes().as_slice()).map_err(
+        |_| error(ErrorKind::Credentials, "signing failed"),
+    )
+}
+
+fn calculate(input: SigningRequest, credentials: Credentials, headers: Headers, query: string) -> Result[
+    Signature,
+    Error,
+] {
+    let (header_text, names) = canonical_headers(headers);
+    let canonical = input.method + "\n" + uri_encode(input.path, true) + "\n" + query + "\n"
+        + header_text
+        + "\n"
+        + names
+        + "\n"
+        + input.payload_hash;
+    let to_sign = "AWS4-HMAC-SHA256\n" + input.timestamp + "\n" + scope(input) + "\n"
+        + hash::sha256(Bytes::from_string(canonical));
+    let date_key = mac(
+        Bytes::from_string("AWS4" + credentials.secret_key),
+        input.timestamp.byte_slice(0, 8),
+    )?;
+    let region_key = mac(date_key, input.region)?;
+    let service_key = mac(region_key, "s3")?;
+    let signing_key = mac(service_key, "aws4_request")?;
+    let signature = hex::encode(mac(signing_key, to_sign)?);
+    Result::Ok(
+        Signature { headers, signature, signed_headers: names, canonical_request: canonical },
+    )
+}
+
+pub fn sign(input: SigningRequest, credentials: Credentials) -> Result[Signature, Error] {
+    let headers = signing_headers(input, credentials, false)?;
+    let result = calculate(input, credentials, headers, canonical_query(input.query))?;
+    let authorization = "AWS4-HMAC-SHA256 Credential=" + credentials.access_key + "/" + scope(input)
+        + ", SignedHeaders="
+        + result.signed_headers
+        + ", Signature="
+        + result.signature;
+    let headers = result.headers.insert("authorization", authorization).map_err(
+        |_| error(ErrorKind::Credentials, "signing failed"),
+    )?;
+    Result::Ok(Signature { headers, ..result })
+}
+
+pub fn presign_query(input: SigningRequest, credentials: Credentials, expires_seconds: isize) -> Result[
+    string,
+    Error,
+] {
+    if expires_seconds < 1 || expires_seconds > 604800 {
+        return Result::Err(
+            error(ErrorKind::Configuration, "presigned expiry must be between 1 and 604800 seconds"),
+        )
+    }
+    for (name, _) in input.query {
+        if ascii_lower(name).starts_with("x-amz-") {
+            return Result::Err(
+                error(ErrorKind::Configuration, "reserved presigned query parameter"),
+            )
+        }
+    }
+    let input = SigningRequest { payload_hash: "UNSIGNED-PAYLOAD", ..input };
+    let headers = signing_headers(input, credentials, true)?;
+    let (_, names) = canonical_headers(headers);
+    let pairs: Vec[(string, string)] = Vec::new();
+    pairs.extend(input.query);
+    pairs.push(("X-Amz-Algorithm", "AWS4-HMAC-SHA256"));
+    pairs.push(("X-Amz-Credential", credentials.access_key + "/" + scope(input)));
+    pairs.push(("X-Amz-Date", input.timestamp));
+    pairs.push(("X-Amz-Expires", expires_seconds.to_string()));
+    pairs.push(("X-Amz-SignedHeaders", names));
+    if credentials.session_token != "" {
+        pairs.push(("X-Amz-Security-Token", credentials.session_token));
+    }
+    let query = canonical_query(pairs);
+    let signed = calculate(input, credentials, headers, query)?;
+    Result::Ok(query + "&X-Amz-Signature=" + signed.signature)
+}
+
+fn ascii_lower(value: string) -> string {
+    let bytes: Vec[byte] = Vec::new();
+    for byte in value.to_bytes() {
+        bytes.push(
+            if byte >= b'A' && byte <= b'Z' {
+                byte + 32
+            } else {
+                byte
+            },
+        );
+    }
+    string_from_utf8(bytes).1
+}

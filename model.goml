@@ -1,0 +1,177 @@
+package s3;
+
+use ecosystem::request;
+use std::bytes::{Bytes};
+use std::context::{Context};
+use std::time::{Duration};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Configuration,
+    Credentials,
+    Cancelled,
+    Transport,
+    Limit,
+    Protocol,
+    Service,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Error {
+    pub kind: ErrorKind,
+    pub message: string,
+    pub status: isize,
+    pub code: string,
+    pub cleanup_failed: bool,
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        self.message
+    }
+}
+
+fn error(kind: ErrorKind, message: string) -> Error {
+    Error { kind, message, status: 0, code: "", cleanup_failed: false }
+}
+
+pub struct Credentials {
+    access_key: string,
+    secret_key: string,
+    session_token: string,
+}
+
+impl Credentials {
+    pub fn new(access_key: string, secret_key: string) -> Result[Credentials, Error] {
+        if access_key.byte_len() < 1 || access_key.byte_len() > 256 || secret_key.byte_len() < 1
+            || secret_key.byte_len() > 4096 {
+            return Result::Err(error(ErrorKind::Credentials, "invalid credential length"))
+        }
+        for value in access_key.to_bytes() {
+            if !(value >= b'A' && value <= b'Z' || value >= b'a' && value <= b'z'
+                || value >= b'0' && value <= b'9') {
+                return Result::Err(error(ErrorKind::Credentials, "invalid access key"))
+            }
+        }
+        Result::Ok(Credentials { access_key, secret_key, session_token: "" })
+    }
+
+    pub fn with_session_token(self: Credentials, token: string) -> Result[Credentials, Error] {
+        if token.byte_len() < 1 || token.byte_len() > 16384 {
+            return Result::Err(error(ErrorKind::Credentials, "invalid session token length"))
+        }
+        for value in token.to_bytes() {
+            if value < 33 || value > 126 {
+                return Result::Err(error(ErrorKind::Credentials, "invalid session token"))
+            }
+        }
+        Result::Ok(Credentials { session_token: token, ..self })
+    }
+}
+
+impl Debug for Credentials {
+    fn debug(self: Credentials) -> string {
+        "Credentials([REDACTED])"
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Addressing {
+    Path,
+    VirtualHost,
+}
+
+pub struct Config {
+    pub endpoint: string,
+    pub region: string,
+    pub addressing: Addressing,
+    pub allow_http: bool,
+    pub max_object_bytes: isize,
+    pub max_metadata_bytes: isize,
+    pub timeout: Duration,
+    pub clock: () -> string,
+}
+
+impl Config {
+    pub fn aws(region: string) -> Config {
+        Config {
+            endpoint: "https://s3." + region + ".amazonaws.com",
+            region,
+            addressing: Addressing::VirtualHost,
+            allow_http: false,
+            max_object_bytes: 67108864,
+            max_metadata_bytes: 1048576,
+            timeout: Duration::from_seconds(30),
+            clock: current_timestamp,
+        }
+    }
+
+    pub fn endpoint(endpoint: string, region: string) -> Config {
+        Config { endpoint, addressing: Addressing::Path, ..Config::aws(region) }
+    }
+}
+
+pub struct Object {
+    pub body: Bytes,
+    pub etag: Option[string],
+    pub version_id: Option[string],
+    pub content_type: Option[string],
+    pub headers: request::Headers,
+}
+
+pub struct ObjectMetadata {
+    pub size: u64,
+    pub etag: Option[string],
+    pub version_id: Option[string],
+    pub content_type: Option[string],
+    pub headers: request::Headers,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ObjectInfo {
+    pub key: string,
+    pub size: u64,
+    pub etag: string,
+    pub last_modified: string,
+}
+
+pub struct ListOptions {
+    pub prefix: string,
+    pub delimiter: string,
+    pub continuation_token: string,
+    pub max_keys: isize,
+}
+
+impl ListOptions {
+    pub fn new() -> ListOptions {
+        ListOptions { prefix: "", delimiter: "", continuation_token: "", max_keys: 1000 }
+    }
+}
+
+pub struct ListPage {
+    pub objects: Vec[ObjectInfo],
+    pub common_prefixes: Vec[string],
+    pub next_token: Option[string],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompletedPart {
+    pub number: isize,
+    pub etag: string,
+}
+
+pub struct Client {
+    transport: request::Client,
+    config: Config,
+    origin: string,
+    authority: string,
+    scheme: string,
+    credentials: (Context) -> Result[Credentials, Error],
+}
+
+pub struct MultipartUpload {
+    client: Client,
+    bucket: string,
+    key: string,
+    upload_id: string,
+}

@@ -1,0 +1,238 @@
+package s3;
+
+use ecosystem::request;
+use ecosystem::xml;
+use std::bytes::{Bytes};
+use std::context;
+use std::context::{Context};
+use std::panic;
+use std::time::{Duration};
+
+impl Client {
+    pub fn create_multipart(
+        self: Client,
+        context: Context,
+        bucket: string,
+        key: string,
+        content_type: string,
+    ) -> Result[MultipartUpload, Error] {
+        validate_key(key)?;
+        let headers = request::Headers::new().insert("content-type", content_type).map_err(
+            |_| error(ErrorKind::Configuration, "invalid content type"),
+        )?;
+        let response = self.send(
+            context,
+            "POST",
+            bucket,
+            key,
+            Vec::from_array([("uploads", "")]),
+            headers,
+            Bytes::new(),
+            true,
+        )?;
+        let document = parse_document(response.bytes(), self.config.max_metadata_bytes)?;
+        if document.name != "InitiateMultipartUploadResult" {
+            return Result::Err(
+                error(ErrorKind::Protocol, "unexpected multipart initiation response"),
+            )
+        }
+        let upload_id = document.required("UploadId")?;
+        if upload_id.byte_len() > 16384 {
+            return Result::Err(error(ErrorKind::Protocol, "multipart upload ID exceeds limit"))
+        }
+        Result::Ok(MultipartUpload { client: self, bucket, key, upload_id })
+    }
+
+    pub fn upload_multipart(
+        self: Client,
+        context: Context,
+        bucket: string,
+        key: string,
+        content_type: string,
+        part_size: isize,
+        next: () -> Result[Option[Bytes], Error],
+    ) -> Result[string, Error] {
+        if part_size < 5242880 || part_size > self.config.max_object_bytes {
+            return Result::Err(
+                error(
+                    ErrorKind::Configuration,
+                    "multipart part size must be at least 5 MiB and within body limit",
+                ),
+            )
+        }
+        let upload = self.create_multipart(context, bucket, key, content_type)?;
+        let settled = Vec::from_array([false]);
+        defer {
+            if !settled[0] {
+                let _ = upload.cleanup();
+            }
+        };
+        let outcome = upload.consume(context, part_size, next);
+        settled[0] = true;
+        match outcome {
+            Ok(etag) => Result::Ok(etag),
+            Err(failure) => {
+                Result::Err(Error { cleanup_failed: !upload.cleanup(), ..failure })
+            },
+        }
+    }
+}
+
+impl MultipartUpload {
+    fn cleanup(self: MultipartUpload) -> bool {
+        match panic::catch(
+            || context::with_timeout(
+                Context::background(),
+                Duration::from_seconds(10),
+                |cleanup, _| self.abort(cleanup),
+            ),
+        ) {
+            Ok(result) => result.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    pub fn upload_id(self: MultipartUpload) -> string {
+        self.upload_id
+    }
+
+    pub fn upload_part(self: MultipartUpload, context: Context, number: isize, body: Bytes) -> Result[
+        CompletedPart,
+        Error,
+    ] {
+        if number < 1 || number > 10000 || body.len() < 1 {
+            return Result::Err(error(ErrorKind::Configuration, "invalid multipart part"))
+        }
+        let query = Vec::from_array(
+            [("partNumber", number.to_string()), ("uploadId", self.upload_id)],
+        );
+        let response = self.client.send(
+            context,
+            "PUT",
+            self.bucket,
+            self.key,
+            query,
+            request::Headers::new(),
+            body,
+            true,
+        )?;
+        let etag = response.headers().get("etag").ok_or(
+            error(ErrorKind::Protocol, "missing multipart ETag"),
+        )?;
+        if etag == "" || etag.byte_len() > 1024 {
+            return Result::Err(error(ErrorKind::Protocol, "invalid multipart ETag"))
+        }
+        Result::Ok(CompletedPart { number, etag })
+    }
+
+    pub fn complete(self: MultipartUpload, context: Context, parts: Vec[CompletedPart]) -> Result[
+        string,
+        Error,
+    ] {
+        if parts.len() < 1 || parts.len() > 10000 {
+            return Result::Err(
+                error(ErrorKind::Configuration, "invalid multipart completion count"),
+            )
+        }
+        let mut previous = 0;
+        let mut body = "<CompleteMultipartUpload>";
+        for part in parts {
+            if part.number <= previous || part.number > 10000 || part.etag == ""
+                || part.etag.byte_len() > 1024 {
+                return Result::Err(
+                    error(
+                        ErrorKind::Configuration,
+                        "multipart completion requires unique ascending part numbers and ETags",
+                    ),
+                )
+            }
+            previous = part.number;
+            let etag = xml::escape_text(part.etag, 8192).map_err(
+                |_| error(ErrorKind::Configuration, "invalid multipart ETag"),
+            )?;
+            body += "<Part><PartNumber>" + part.number.to_string() + "</PartNumber><ETag>" + etag
+                + "</ETag></Part>";
+            if body.byte_len() > self.client.config.max_metadata_bytes {
+                return Result::Err(
+                    error(ErrorKind::Limit, "multipart completion metadata limit exceeded"),
+                )
+            }
+        }
+        body += "</CompleteMultipartUpload>";
+        if body.byte_len() > self.client.config.max_metadata_bytes {
+            return Result::Err(
+                error(ErrorKind::Limit, "multipart completion metadata limit exceeded"),
+            )
+        }
+        let headers = request::Headers::new().insert("content-type", "application/xml").map_err(
+            transport_error,
+        )?;
+        let response = self.client.send(
+            context,
+            "POST",
+            self.bucket,
+            self.key,
+            Vec::from_array([("uploadId", self.upload_id)]),
+            headers,
+            Bytes::from_string(body),
+            true,
+        )?;
+        let document = parse_document(response.bytes(), self.client.config.max_metadata_bytes)?;
+        if document.name == "Error" {
+            return Result::Err(
+                Error {
+                    status: 200,
+                    code: safe_code(document.optional("Code")?),
+                    ..error(ErrorKind::Service, "S3 multipart completion failed"),
+                },
+            )
+        }
+        if document.name != "CompleteMultipartUploadResult" {
+            return Result::Err(
+                error(ErrorKind::Protocol, "unexpected multipart completion response"),
+            )
+        }
+        document.required("ETag")
+    }
+
+    pub fn abort(self: MultipartUpload, context: Context) -> Result[(), Error] {
+        self.client.send(
+            context,
+            "DELETE",
+            self.bucket,
+            self.key,
+            Vec::from_array([("uploadId", self.upload_id)]),
+            request::Headers::new(),
+            Bytes::new(),
+            true,
+        )?;
+        Result::Ok(())
+    }
+
+    fn consume(
+        self: MultipartUpload,
+        context: Context,
+        part_size: isize,
+        next: () -> Result[Option[Bytes], Error],
+    ) -> Result[string, Error] {
+        let parts = Vec::new();
+        let mut short = false;
+        loop {
+            check_context(context)?;
+            let piece = next()?;
+            match piece {
+                None => break,
+                Some(body) => {
+                    if short || body.len() > part_size || parts.len() >= 10000 {
+                        return Result::Err(
+                            error(ErrorKind::Configuration, "invalid multipart chunk sequence"),
+                        )
+                    }
+                    short = body.len() < 5242880;
+                    parts.push(self.upload_part(context, parts.len() + 1, body)?);
+                },
+            }
+        }
+        self.complete(context, parts)
+    }
+}

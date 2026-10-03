@@ -1,0 +1,413 @@
+package s3;
+
+use ecosystem::request;
+use std::bytes::{Bytes};
+use std::collections::{HashSet};
+use std::context::{Context};
+use std::crypto::hash;
+use std::net::url::{Reference};
+
+fn transport_error(value: request::Error) -> Error {
+    match value.kind {
+        request::ErrorKind::Cancelled => error(ErrorKind::Cancelled, "S3 request cancelled"),
+        request::ErrorKind::BodyLimit => error(ErrorKind::Limit, "S3 body limit exceeded"),
+        _ => error(ErrorKind::Transport, "S3 transport failed"),
+    }
+}
+
+fn check_context(context: Context) -> Result[(), Error] {
+    if context.error().is_some() {
+        Result::Err(error(ErrorKind::Cancelled, "S3 request cancelled"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn validate_bucket(bucket: string) -> Result[(), Error] {
+    if bucket.byte_len() < 3 || bucket.byte_len() > 63 || bucket.starts_with("-")
+        || bucket.ends_with("-")
+        || bucket.starts_with(".")
+        || bucket.ends_with(".")
+        || bucket.contains("..")
+        || bucket.contains(".-")
+        || bucket.contains("-.") {
+        return Result::Err(error(ErrorKind::Configuration, "invalid bucket name"))
+    }
+    for byte in bucket.to_bytes() {
+        if !(byte >= b'a' && byte <= b'z' || byte >= b'0' && byte <= b'9' || byte == b'-'
+            || byte == b'.') {
+            return Result::Err(error(ErrorKind::Configuration, "invalid bucket name"))
+        }
+    }
+    Result::Ok(())
+}
+
+fn validate_key(key: string) -> Result[(), Error] {
+    if key.byte_len() < 1 || key.byte_len() > 1024 {
+        return Result::Err(
+            error(ErrorKind::Configuration, "object key must contain 1 to 1024 UTF-8 bytes"),
+        )
+    }
+    Result::Ok(())
+}
+
+impl Client {
+    pub fn new(config: Config, credentials: Credentials) -> Result[Client, Error] {
+        Client::with_provider(config, |_| Result::Ok(credentials))
+    }
+
+    pub fn with_provider(config: Config, provider: (Context) -> Result[Credentials, Error]) -> Result[
+        Client,
+        Error,
+    ] {
+        validate_region(config.region)?;
+        if config.max_object_bytes < 1 || config.max_object_bytes > 1073741824
+            || config.max_metadata_bytes < 1
+            || config.max_metadata_bytes > 16777216 {
+            return Result::Err(error(ErrorKind::Configuration, "invalid S3 body limits"))
+        }
+        let parsed = request::Url::parse(config.endpoint).map_err(
+            |_| error(ErrorKind::Configuration, "invalid S3 endpoint"),
+        )?;
+        let reference = Reference::parse(parsed.as_string(), 8192).map_err(
+            |_| error(ErrorKind::Configuration, "invalid S3 endpoint"),
+        )?;
+        let original = Reference::parse(config.endpoint, 8192).map_err(
+            |_| error(ErrorKind::Configuration, "invalid S3 endpoint"),
+        )?;
+        if original.raw_fragment().is_some() || reference.raw_query().is_some()
+            || reference.raw_path() != "/" {
+            return Result::Err(
+                error(ErrorKind::Configuration, "S3 endpoint must contain only an origin"),
+            )
+        }
+        let authority = reference.raw_authority().unwrap_or("");
+        let scheme = reference.scheme().unwrap_or("");
+        if scheme == "http" && !config.allow_http {
+            return Result::Err(error(ErrorKind::Configuration, "plain HTTP requires allow_http"))
+        }
+        if config.addressing == Addressing::VirtualHost
+            && (authority.contains(":") || authority.contains("[")) {
+            return Result::Err(
+                error(
+                    ErrorKind::Configuration,
+                    "virtual-host addressing requires an unqualified DNS host",
+                ),
+            )
+        }
+        let transport = request::Client::builder().redirect(request::RedirectPolicy::None).gzip(
+            false,
+        ).no_proxy().timeout(config.timeout).body_limit(config.max_object_bytes).request_body_limit(
+            config.max_object_bytes,
+        ).build().map_err(transport_error)?;
+        Result::Ok(
+            Client {
+                transport,
+                config,
+                origin: scheme + "://" + authority,
+                authority,
+                scheme,
+                credentials: provider,
+            },
+        )
+    }
+
+    pub fn close(self: Client) -> () {
+        self.transport.close()
+    }
+
+    fn target(self: Client, bucket: string, key: string) -> Result[(string, string, string), Error] {
+        validate_bucket(bucket)?;
+        let (host, path) = match self.config.addressing {
+            Addressing::Path => (self.authority, "/" + bucket + "/" + key),
+            Addressing::VirtualHost => {
+                if bucket.contains(".") && self.scheme == "https" {
+                    return Result::Err(
+                        error(
+                            ErrorKind::Configuration,
+                            "dotted buckets require path addressing over HTTPS",
+                        ),
+                    )
+                };
+                (bucket + "." + self.authority, "/" + key)
+            },
+        };
+        Result::Ok((self.scheme + "://" + host + uri_encode(path, true), host, path))
+    }
+
+    fn send(
+        self: Client,
+        context: Context,
+        method: string,
+        bucket: string,
+        key: string,
+        query: Vec[(string, string)],
+        headers: request::Headers,
+        body: Bytes,
+        metadata: bool,
+    ) -> Result[request::Response, Error] {
+        check_context(context)?;
+        if body.len() > self.config.max_object_bytes {
+            return Result::Err(error(ErrorKind::Limit, "S3 request body limit exceeded"))
+        }
+        let body = body.copy();
+        let (target, host, path) = self.target(bucket, key)?;
+        let credentials = (self.credentials)(context).map_err(
+            |_| error(ErrorKind::Credentials, "S3 credential provider failed"),
+        )?;
+        check_context(context)?;
+        let signed = sign(
+            SigningRequest {
+                method,
+                host,
+                path,
+                query,
+                headers,
+                payload_hash: hash::sha256(body),
+                timestamp: (self.config.clock)(),
+                region: self.config.region,
+            },
+            credentials,
+        )?;
+        let query_text = canonical_query(query);
+        let url = target
+            + if query_text == "" {
+                ""
+            } else {
+                "?" + query_text
+            };
+        let limit = if metadata {
+            self.config.max_metadata_bytes
+        } else {
+            self.config.max_object_bytes
+        };
+        let response = self.transport.request(method, url).headers(signed.headers.remove("host")).body(
+            body,
+        ).body_limit(limit).redirect(request::RedirectPolicy::None).send_with(context).map_err(
+            transport_error,
+        )?;
+        if !response.status().is_success() {
+            let mut code = "";
+            if let Ok(document) = parse_document(response.bytes(), self.config.max_metadata_bytes) {
+                if document.name == "Error" {
+                    code = safe_code(document.optional("Code").unwrap_or(""));
+                }
+            }
+            return Result::Err(
+                Error {
+                    status: response.status().as_isize(),
+                    code,
+                    ..error(ErrorKind::Service, "S3 service rejected request"),
+                },
+            )
+        }
+        Result::Ok(response)
+    }
+
+    pub fn get_object(self: Client, context: Context, bucket: string, key: string) -> Result[
+        Object,
+        Error,
+    ] {
+        validate_key(key)?;
+        let response = self.send(
+            context,
+            "GET",
+            bucket,
+            key,
+            Vec::new(),
+            request::Headers::new(),
+            Bytes::new(),
+            false,
+        )?;
+        let headers = response.headers();
+        Result::Ok(
+            Object {
+                body: response.bytes(),
+                etag: headers.get("etag"),
+                version_id: headers.get("x-amz-version-id"),
+                content_type: headers.get("content-type"),
+                headers,
+            },
+        )
+    }
+
+    pub fn head_object(self: Client, context: Context, bucket: string, key: string) -> Result[
+        ObjectMetadata,
+        Error,
+    ] {
+        validate_key(key)?;
+        let response = self.send(
+            context,
+            "HEAD",
+            bucket,
+            key,
+            Vec::new(),
+            request::Headers::new(),
+            Bytes::new(),
+            true,
+        )?;
+        let headers = response.headers();
+        let size = parse_unsigned(
+            headers.get("content-length").ok_or(error(ErrorKind::Protocol, "missing object size"))?,
+        )?;
+        Result::Ok(
+            ObjectMetadata {
+                size,
+                etag: headers.get("etag"),
+                version_id: headers.get("x-amz-version-id"),
+                content_type: headers.get("content-type"),
+                headers,
+            },
+        )
+    }
+
+    pub fn put_object(
+        self: Client,
+        context: Context,
+        bucket: string,
+        key: string,
+        body: Bytes,
+        content_type: string,
+    ) -> Result[Option[string], Error] {
+        validate_key(key)?;
+        let headers = request::Headers::new().insert("content-type", content_type).map_err(
+            |_| error(ErrorKind::Configuration, "invalid content type"),
+        )?;
+        let response = self.send(context, "PUT", bucket, key, Vec::new(), headers, body, true)?;
+        Result::Ok(response.headers().get("etag"))
+    }
+
+    pub fn delete_object(self: Client, context: Context, bucket: string, key: string) -> Result[
+        (),
+        Error,
+    ] {
+        validate_key(key)?;
+        self.send(
+            context,
+            "DELETE",
+            bucket,
+            key,
+            Vec::new(),
+            request::Headers::new(),
+            Bytes::new(),
+            true,
+        )?;
+        Result::Ok(())
+    }
+
+    pub fn list_objects(self: Client, context: Context, bucket: string, options: ListOptions) -> Result[
+        ListPage,
+        Error,
+    ] {
+        if options.max_keys < 1 || options.max_keys > 1000 || options.prefix.byte_len() > 1024
+            || options.delimiter.byte_len() > 1024
+            || options.continuation_token.byte_len() > 16384 {
+            return Result::Err(error(ErrorKind::Configuration, "invalid list options"))
+        }
+        let query = Vec::from_array(
+            [
+                ("list-type", "2"),
+                ("encoding-type", "url"),
+                ("max-keys", options.max_keys.to_string()),
+            ],
+        );
+        if options.prefix != "" {
+            query.push(("prefix", options.prefix));
+        }
+        if options.delimiter != "" {
+            query.push(("delimiter", options.delimiter));
+        }
+        if options.continuation_token != "" {
+            query.push(("continuation-token", options.continuation_token));
+        }
+        let response = self.send(
+            context,
+            "GET",
+            bucket,
+            "",
+            query,
+            request::Headers::new(),
+            Bytes::new(),
+            true,
+        )?;
+        parse_list(response.bytes(), self.config.max_metadata_bytes)
+    }
+
+    pub fn list_pages(
+        self: Client,
+        context: Context,
+        bucket: string,
+        options: ListOptions,
+        max_pages: isize,
+        consume: (ListPage) -> Result[bool, Error],
+    ) -> Result[isize, Error] {
+        if max_pages < 1 || max_pages > 100000 {
+            return Result::Err(error(ErrorKind::Configuration, "invalid page limit"))
+        }
+        let seen: HashSet[string] = HashSet::new();
+        let mut token_bytes = 0;
+        let mut current = options;
+        for index in 0..max_pages {
+            let page = self.list_objects(context, bucket, current)?;
+            if !consume(page)? {
+                return Result::Ok(index + 1)
+            }
+            match page.next_token {
+                None => return Result::Ok(index + 1),
+                Some(token) => {
+                    if token == current.continuation_token || seen.contains(token) {
+                        return Result::Err(
+                            error(ErrorKind::Protocol, "repeated S3 continuation token"),
+                        )
+                    }
+                    if token.byte_len() > self.config.max_metadata_bytes - token_bytes {
+                        return Result::Err(
+                            error(ErrorKind::Limit, "S3 continuation history limit exceeded"),
+                        )
+                    }
+                    token_bytes += token.byte_len();
+                    let _ = seen.insert(token);
+                    current = ListOptions { continuation_token: token, ..current };
+                },
+            }
+        }
+        Result::Err(error(ErrorKind::Limit, "S3 page limit exceeded"))
+    }
+
+    pub fn presign(
+        self: Client,
+        context: Context,
+        method: string,
+        bucket: string,
+        key: string,
+        expires_seconds: isize,
+    ) -> Result[string, Error] {
+        check_context(context)?;
+        validate_key(key)?;
+        if method != "GET" && method != "HEAD" && method != "PUT" && method != "DELETE" {
+            return Result::Err(
+                error(ErrorKind::Configuration, "unsupported presigned object method"),
+            )
+        }
+        let (target, host, path) = self.target(bucket, key)?;
+        let credentials = (self.credentials)(context).map_err(
+            |_| error(ErrorKind::Credentials, "S3 credential provider failed"),
+        )?;
+        check_context(context)?;
+        let query = presign_query(
+            SigningRequest {
+                method,
+                host,
+                path,
+                query: Vec::new(),
+                headers: request::Headers::new(),
+                payload_hash: "UNSIGNED-PAYLOAD",
+                timestamp: (self.config.clock)(),
+                region: self.config.region,
+            },
+            credentials,
+            expires_seconds,
+        )?;
+        Result::Ok(target + "?" + query)
+    }
+}
