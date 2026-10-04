@@ -72,6 +72,7 @@ provider. No credentials or default account settings are built into this module.
 `Config.clock` is `() -> string`, returning a UTC timestamp in
 `YYYYMMDDTHHMMSSZ` form. Its default uses the system clock; an injected clock makes
 signing deterministic. Invalid calendar dates fail before sending a request.
+Non-ASCII digits and malformed timestamps return configuration errors as well.
 
 The lower-level `SigningRequest`, `sign` and `presign_query` APIs are public for
 testing or alternate transports. `SigningRequest.path` is the **raw, decoded

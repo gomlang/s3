@@ -1,0 +1,26 @@
+package tests;
+
+use ecosystem::s3;
+use std::testing;
+
+#[test]
+fn malformed_unicode_timestamps_return_configuration_errors() -> () {
+    for replacement in["é", "中", "😀", "١"] {
+        for start in 0..15 {
+            let end = start + replacement.byte_len();
+            if end > 8 && (start < 9 || end > 15) {
+                continue;
+            }
+            let timestamp = input().timestamp.byte_slice(0, start) + replacement
+                + input().timestamp.byte_slice(end, 16);
+            let request = s3::SigningRequest { timestamp, ..input() };
+            let error = testing::expect_err(s3::sign(request, credentials()), "non-ASCII date");
+            testing::assert_eq(error.kind, s3::ErrorKind::Configuration);
+            let error = testing::expect_err(
+                s3::presign_query(request, credentials(), 60),
+                "non-ASCII presign date",
+            );
+            testing::assert_eq(error.kind, s3::ErrorKind::Configuration);
+        }
+    }
+}

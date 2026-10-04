@@ -15,6 +15,14 @@ fn validate_timestamp(value: string) -> Result[(), Error] {
     if value.byte_len() != 16 || value.byte_get(8) != b'T' || value.byte_get(15) != b'Z' {
         return Result::Err(error(ErrorKind::Configuration, "invalid signing timestamp"))
     }
+    for index in 0..16 {
+        if index != 8 && index != 15 {
+            let digit = value.byte_get(index);
+            if digit < b'0' || digit > b'9' {
+                return Result::Err(error(ErrorKind::Configuration, "invalid signing timestamp"))
+            }
+        }
+    }
     let text = value.byte_slice(0, 4) + "-" + value.byte_slice(4, 6) + "-" + value.byte_slice(6, 8)
         + "T"
         + value.byte_slice(9, 11)

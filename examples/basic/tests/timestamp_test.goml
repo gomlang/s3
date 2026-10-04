@@ -1,0 +1,24 @@
+package tests;
+
+use ecosystem::s3;
+use std::context::{Context};
+use std::testing;
+
+#[test]
+fn malformed_injected_clocks_return_errors_without_panicking() -> () {
+    for timestamp in["202é101T000000Z", "20260101T0é0000Z"] {
+        let client = testing::expect_ok(
+            s3::Client::new(
+                s3::Config { clock: || timestamp, ..s3::Config::aws("us-east-1") },
+                testing::expect_ok(s3::Credentials::new("example", "secret"), "credentials"),
+            ),
+            "client",
+        );
+        defer client.close();
+        let error = testing::expect_err(
+            client.presign(Context::background(), "GET", "bucket", "key", 60),
+            "non-ASCII clock",
+        );
+        testing::assert_eq(error.kind, s3::ErrorKind::Configuration);
+    }
+}
