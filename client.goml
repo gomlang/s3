@@ -355,7 +355,7 @@ impl Client {
             match page.next_token {
                 None => return Result::Ok(index + 1),
                 Some(token) => {
-                    if token == current.continuation_token || seen.contains(token) {
+                    if token == options.continuation_token || seen.contains(token) {
                         return Result::Err(
                             error(ErrorKind::Protocol, "repeated S3 continuation token"),
                         )

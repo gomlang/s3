@@ -1,0 +1,37 @@
+package tests;
+
+use ecosystem::s3;
+use std::context::{Context};
+use std::testing;
+
+#[test]
+fn resumed_pagination_rejects_returning_to_its_initial_token() -> () {
+    with_fixture(
+        |endpoint| {
+            let client = fixture_client(endpoint, 1024);
+            defer client.close();
+            for max_pages in[2, 10] {
+                let tokens = Vec::new();
+                let problem = testing::expect_err(
+                    client.list_pages(
+                        Context::background(),
+                        "bucket",
+                        s3::ListOptions {
+                            prefix: "cycle",
+                            continuation_token: "A",
+                            ..s3::ListOptions::new(),
+                        },
+                        max_pages,
+                        |page| {
+                            tokens.push(testing::expect_some(page.next_token, "cycle token"));
+                            Result::Ok(true)
+                        },
+                    ),
+                    "initial token cycle",
+                );
+                testing::assert_eq(problem.kind, s3::ErrorKind::Protocol);
+                testing::assert(tokens == Vec::from_array(["B", "A"]));
+            }
+        },
+    );
+}

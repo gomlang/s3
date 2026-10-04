@@ -107,7 +107,8 @@ encoding; continuation tokens are opaque and are never URL-decoded as keys.
 
 `list_pages(context, bucket, options, max_pages, consume)` invokes
 `(ListPage) -> Result[bool, Error]` once per page and returns the page count.
-Return `false` to stop early. It detects repeated tokens and fails when another
+Return `false` to stop early. It detects repeated tokens, including a return to
+the caller's initial continuation token, and fails when another
 page would exceed `max_pages`, avoiding unbounded enumeration. It retains only
 the token history, bounded by 100000 pages and the metadata byte budget; consumers decide whether to retain
 object records. Missing/duplicate scalar fields, invalid numbers, DTDs, external/custom entities,
