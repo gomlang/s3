@@ -3,7 +3,7 @@
 `ecosystem::s3` is a synchronous S3-compatible object client written in GoML.
 It uses `ecosystem::request` for HTTP/TLS, `ecosystem::xml` for bounded protocol
 parsing, `ecosystem::datetime` for UTC timestamps, and the standard SHA-256/HMAC
-implementations for AWS Signature Version 4. Requires the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json).
+implementations for AWS Signature Version 4. Requires the source-built GoML toolchain with unversioned registry support pinned in [workflows/ci/toolchain.json](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json).
 
 The initial API supports ordinary regional S3 buckets and compatible endpoints:
 
