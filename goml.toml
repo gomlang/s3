@@ -2,6 +2,6 @@
 path = "ecosystem::s3"
 
 [dependencies]
-"ecosystem::request" = "0.1.0"
-"ecosystem::xml" = "0.1.0"
-"ecosystem::datetime" = "0.1.0"
+"ecosystem::request" = true
+"ecosystem::xml" = true
+"ecosystem::datetime" = true

@@ -3,7 +3,7 @@
 `ecosystem::s3` is a synchronous S3-compatible object client written in GoML.
 It uses `ecosystem::request` for HTTP/TLS, `ecosystem::xml` for bounded protocol
 parsing, `ecosystem::datetime` for UTC timestamps, and the standard SHA-256/HMAC
-implementations for AWS Signature Version 4. Requires GoML 0.1.57 or newer.
+implementations for AWS Signature Version 4. Requires the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json).
 
 The initial API supports ordinary regional S3 buckets and compatible endpoints:
 
@@ -165,7 +165,7 @@ endpoints and SigV4a. Compatibility with every third-party service is not claime
 
 ## Verification and protocol references
 
-Run `goml fmt --check`, `goml test` and `goml verify --timeout 300s` from the
+Run `goml fmt --check` and `goml test --timeout 300s` from the
 module root. `goml test` includes AWS's four published header-signing vectors,
 its presigning vector, canonicalization/security negative tests, and local HTTP
 integration tests. The HTTP fixture uses Python 3's standard `hashlib`/`hmac` and
