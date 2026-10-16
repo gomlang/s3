@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   verify:
-    uses: gomlang/workflows/.github/workflows/ecosystem-ci.yml@f657e67667b1c5ac96f10ecae4a3f65d4e0ef480
+    uses: gomlang/workflows/.github/workflows/ecosystem-ci.yml@778e1a9a9b3d38a15902f75100cfd801b950b741
     with:
       module: s3
-      workflows-ref: f657e67667b1c5ac96f10ecae4a3f65d4e0ef480
+      workflows-ref: 778e1a9a9b3d38a15902f75100cfd801b950b741
