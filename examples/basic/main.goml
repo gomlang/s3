@@ -23,6 +23,23 @@ pub fn exercise() -> () {
     );
     testing::assert(url.contains("X-Amz-Expires=300"));
     testing::assert(!url.contains("example-only-secret"));
+    let invalid = testing::expect_err(
+        client.get_object_stream(
+            Context::background(),
+            "example-bucket",
+            "",
+            |stream| {
+                let _ = stream.content_length();
+                let _ = stream.headers();
+                let _ = stream.etag();
+                let _ = stream.version_id();
+                let _ = stream.content_type();
+                stream.copy_to(std::io::Cursor::new(std::bytes::Bytes::new()))
+            },
+        ),
+        "stream validates key before network",
+    );
+    testing::assert(invalid.kind == s3::ErrorKind::Configuration);
 }
 
 fn main() -> () {

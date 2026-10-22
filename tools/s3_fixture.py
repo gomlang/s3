@@ -30,6 +30,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     aborted = 0
     redirected = 0
     checked = 0
+    released = threading.Event()
+    stream_closed = threading.Event()
 
     def log_message(self, *args):
         pass
@@ -95,6 +97,13 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         return urllib.parse.unquote(target.path), query
 
     def dispatch(self):
+        if self.path == "/release":
+            Fixture.released.set()
+            self.reply(200)
+            return
+        if self.path == "/stream-closed":
+            self.reply(200, "yes" if Fixture.stream_closed.wait(2) else "no")
+            return
         if self.path == "/stats":
             self.reply(200, json.dumps({"checked": Fixture.checked, "aborted": Fixture.aborted, "redirected": Fixture.redirected}))
             return
@@ -107,6 +116,43 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             path, query = self.verified(body)
         except Exception:
             self.reply(403, "<Error><Code>SignatureDoesNotMatch</Code></Error>")
+            return
+        if path == "/bucket/stream-gated":
+            self.send_response(200)
+            self.send_header("Content-Length", "6")
+            self.send_header("ETag", '"stream"')
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("x-amz-version-id", "v-stream")
+            self.end_headers()
+            self.wfile.write(b"abc")
+            self.wfile.flush()
+            if Fixture.released.wait(3):
+                self.wfile.write(b"def")
+            self.close_connection = True
+            return
+        if path == "/bucket/stream-open":
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"abc")
+            self.wfile.flush()
+            self.connection.settimeout(3)
+            if self.connection.recv(1) == b"":
+                Fixture.stream_closed.set()
+            self.close_connection = True
+            return
+        if path in ("/bucket/stream-chunked", "/bucket/stream-error"):
+            self.send_response(403 if path.endswith("error") else 200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n")
+            return
+        if path == "/bucket/stream-truncated":
+            self.send_response(200)
+            self.send_header("Content-Length", "10")
+            self.end_headers()
+            self.wfile.write(b"abc")
+            self.close_connection = True
             return
         if path == "/bucket/redirect":
             self.reply(307, headers={"Location": "http://127.0.0.1:" + str(self.server.server_port) + "/leak"})

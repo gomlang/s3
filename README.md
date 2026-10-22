@@ -7,7 +7,7 @@ implementations for AWS Signature Version 4. Requires the source-built GoML tool
 
 The initial API supports ordinary regional S3 buckets and compatible endpoints:
 
-- Signed GET, HEAD, PUT and DELETE object requests.
+- Signed GET, HEAD, PUT and DELETE object requests, including callback-scoped streaming downloads.
 - ListObjectsV2, prefixes, delimiters, continuation tokens, URL-encoded keys and
   bounded callback-based pagination.
 - Presigned GET, HEAD, PUT and DELETE URLs, with expiry from 1 to 604800 seconds.
@@ -40,6 +40,30 @@ fn store(access_key: string, secret_key: string) -> Result[Bytes, s3::Error] {
 headers. `head_object` returns the declared object size and the same metadata.
 `put_object` returns an optional ETag; `delete_object` returns `Result[(), Error]`.
 ETags remain opaque strings, including quotes; they are not interpreted as MD5.
+
+`get_object_stream(context, bucket, key, consume)` invokes
+`(ObjectStream) -> Result[T, Error]` after successful response headers arrive,
+before collecting the body. Inspect `etag()`, `version_id()`, `content_type()`
+and `headers()` inside the callback. `content_length()` is optional for chunked
+or connection-delimited responses. Read into caller-owned storage with
+`read_bytes(buffer)`, request owned chunks with `chunk(max_bytes)` (1 through
+1 MiB), or use `copy_to(writer)` to copy the remaining bytes to any `std::io::Write`
+and obtain the copied byte count. Chunk boundaries are transport-dependent.
+
+The stream closes when the callback returns, returns an error, or panics; an
+early successful return deliberately leaves the unread suffix unvalidated.
+Retained handles cannot read after the callback, although their metadata remains
+available. `close()` permits explicit early closure. Concurrent reads serialize;
+applications must finish their reading tasks before leaving the callback.
+Reading to EOF validates framing and detects truncation. The object budget applies
+cumulatively even when Content-Length is absent; declared oversize objects fail
+before invoking the callback. Read failures remain errors even if the callback
+ignores them. Cancellation/transport failures take precedence over callback errors;
+otherwise caller errors are preserved unchanged. Writer failures become a fixed
+transport error and partial output remains the writer owner's responsibility.
+Non-success response bodies use the independent metadata budget and never invoke
+the application callback. No automatic retries, range requests or seek support
+are added. Streaming currently uses request's HTTP/1.1 connection-scoped path.
 
 `Config::aws(region)` uses HTTPS and virtual-host addressing at
 `s3.<region>.amazonaws.com`. Use `Config::endpoint(origin, region)` for another
@@ -142,8 +166,9 @@ configure the bucket's incomplete-multipart lifecycle rule as appropriate.
 ## Bounds and errors
 
 The default per-object/request/part budget is 64 MiB, adjustable from 1 byte to
-1 GiB. GET and ordinary PUT are buffered within this limit; they are not
-unbounded streaming APIs. Multipart provides the bounded upload path for larger
+1 GiB. `get_object` and ordinary PUT are buffered within this limit.
+`get_object_stream` avoids buffering the entire download but retains the same
+cumulative object limit. Multipart provides the bounded upload path for larger
 objects. The default metadata response budget is 1 MiB, configurable up to
 16 MiB. XML parsing also caps depth (16), attributes per element (16) and tokens
 (20000). Signing limits decoded header/query metadata to 64 KiB, 100 headers and
@@ -178,6 +203,7 @@ Python 3, but need no external service, AWS account or real credentials.
 
 Protocol references:
 
+- [MinIO Go streaming object reader and lifecycle](https://github.com/minio/minio-go/blob/master/api-get-object.go)
 - [AWS SigV4 canonicalization and signing vectors](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html)
 - [AWS presigned URL signing](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sigv4-query-string-auth.html)
 - [ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)

@@ -449,3 +449,281 @@ fn completion_metadata_bound_counts_the_closing_element() -> () {
         },
     );
 }
+
+#[test]
+fn streamed_download_metadata_gate_and_lifetime() -> () {
+    with_fixture(
+        |endpoint| {
+            let client = fixture_client(endpoint, 1024);
+            defer client.close();
+            let http = testing::expect_ok(request::Client::new(), "http");
+            defer http.close();
+            let retained: Ref[Option[s3::ObjectStream]] = Ref::new(Option::None);
+            let result = testing::expect_ok(
+                client.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "stream-gated",
+                    |stream| {
+                        retained.set(Option::Some(stream));
+                        testing::assert(stream.content_length() == Option::Some(6));
+                        testing::assert(stream.etag() == Option::Some("\"stream\""));
+                        testing::assert(stream.version_id() == Option::Some("v-stream"));
+                        testing::assert(
+                            stream.content_type() == Option::Some("application/octet-stream"),
+                        );
+                        let first: Vec[byte] = Vec::new();
+                        while first.len() < 3 {
+                            let chunk = testing::expect_some(
+                                stream.chunk(3 - first.len())?,
+                                "prefix before release",
+                            );
+                            for value in chunk.to_vec() {
+                                first.push(value);
+                            }
+                        }
+                        testing::assert(first == b"abc");
+                        testing::expect_ok(
+                            http.get(endpoint + "/release").send(),
+                            "release tail only after first read",
+                        );
+                        let output = std::io::Cursor::new(Bytes::new());
+                        testing::assert_eq(stream.copy_to(output)?, 3);
+                        Result::Ok(string_from_utf8(output.bytes().to_vec()).1)
+                    },
+                ),
+                "stream download",
+            );
+            testing::assert_eq(result, "def");
+            let stale = testing::expect_some(retained.get(), "retained stream");
+            testing::assert(stale.chunk(1).is_err());
+            testing::assert(stale.etag() == Option::Some("\"stream\""));
+            testing::expect_ok(
+                client.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "stream-open",
+                    |stream| {
+                        testing::assert(stream.chunk(3)?.is_some());
+                        Result::Ok(())
+                    },
+                ),
+                "early return",
+            );
+            testing::assert_eq(
+                testing::expect_ok(
+                    testing::expect_ok(http.get(endpoint + "/stream-closed").send(), "closure").text(),
+                    "text",
+                ),
+                "yes",
+            );
+        },
+    );
+}
+
+#[test]
+fn streamed_download_limits_errors_and_cancellation() -> () {
+    with_fixture(
+        |endpoint| {
+            let small = fixture_client(endpoint, 5);
+            defer small.close();
+            let called = Ref::new(false);
+            let too_big = testing::expect_err(
+                small.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "huge",
+                    |_| {
+                        called.set(true);
+                        Result::Ok(())
+                    },
+                ),
+                "declared limit",
+            );
+            testing::assert(too_big.kind == s3::ErrorKind::Limit && !called.get());
+            let cumulative = testing::expect_err(
+                small.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "stream-chunked",
+                    |stream| {
+                        testing::assert(stream.content_length().is_none());
+                        loop {
+                            match stream.chunk(2) {
+                                Ok(Some(_)) => (),
+                                _ => break,
+                            }
+                        }
+                        Result::Ok(())
+                    },
+                ),
+                "swallowed cumulative limit",
+            );
+            testing::assert(cumulative.kind == s3::ErrorKind::Limit);
+            let missing = testing::expect_err(
+                small.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "missing",
+                    |_| Result::Ok(()),
+                ),
+                "service budget independent from object budget",
+            );
+            testing::assert_eq(missing.code, "NoSuchKey");
+            let client = fixture_client(endpoint, 1024);
+            defer client.close();
+            let truncated = testing::expect_err(
+                client.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "stream-truncated",
+                    |stream| {
+                        loop {
+                            if stream.chunk(4)?.is_none() {
+                                break;
+                            }
+                        }
+                        Result::Ok(())
+                    },
+                ),
+                "truncation",
+            );
+            testing::assert(truncated.kind == s3::ErrorKind::Transport);
+            let custom = s3::Error {
+                kind: s3::ErrorKind::Protocol,
+                message: "consumer failed",
+                status: 42,
+                code: "custom",
+                cleanup_failed: false,
+            };
+            let reject: (s3::ObjectStream) -> Result[(), s3::Error] = |_| Result::Err(custom);
+            let callback_error = testing::expect_err(
+                client.get_object_stream(Context::background(), "bucket", "stream-chunked", reject),
+                "callback error",
+            );
+            testing::assert(callback_error == custom);
+            context::with_cancel(
+                Context::background(),
+                |control, cancel| {
+                    let cancelled = testing::expect_err(
+                        client.get_object_stream(
+                            control,
+                            "bucket",
+                            "stream-open",
+                            |stream| {
+                                let _ = stream.chunk(3)?;
+                                cancel.cancel();
+                                let _ = stream.chunk(3)?;
+                                Result::Ok(())
+                            },
+                        ),
+                        "cancel read",
+                    );
+                    testing::assert(cancelled.kind == s3::ErrorKind::Cancelled);
+                },
+            );
+            let bounded = testing::expect_ok(
+                s3::Client::new(
+                    s3::Config {
+                        allow_http: true,
+                        max_metadata_bytes: 4,
+                        max_object_bytes: 1024,
+                        clock: || "20130524T000000Z",
+                        ..s3::Config::endpoint(endpoint, "us-east-1"),
+                    },
+                    testing::expect_ok(
+                        credentials().with_session_token("session+/="),
+                        "credentials",
+                    ),
+                ),
+                "bounded client",
+            );
+            defer bounded.close();
+            let failure = testing::expect_err(
+                bounded.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "stream-error",
+                    |_| Result::Ok(()),
+                ),
+                "bounded service body",
+            );
+            testing::assert(failure.kind == s3::ErrorKind::Limit);
+        },
+    );
+}
+
+#[test]
+fn streamed_download_panic_cleanup_and_exact_boundary() -> () {
+    with_fixture(
+        |endpoint| {
+            let client = fixture_client(endpoint, 1024);
+            defer client.close();
+            let explode: (s3::ObjectStream) -> Result[(), s3::Error] = |stream| {
+                let _ = stream.chunk(3)?;
+                panic::raise("download consumer panic")
+            };
+            let caught = panic::catch(
+                || client.get_object_stream(Context::background(), "bucket", "stream-open", explode),
+            );
+            testing::assert_eq(
+                testing::expect_err(caught, "panic propagation").message(),
+                "download consumer panic",
+            );
+            let http = testing::expect_ok(request::Client::new(), "http");
+            defer http.close();
+            testing::assert_eq(
+                testing::expect_ok(
+                    testing::expect_ok(
+                        http.get(endpoint + "/stream-closed").send(),
+                        "panic closes transport",
+                    ).text(),
+                    "text",
+                ),
+                "yes",
+            );
+            let exact = fixture_client(endpoint, 6);
+            defer exact.close();
+            let count = testing::expect_ok(
+                exact.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "stream-chunked",
+                    |stream| {
+                        testing::assert(stream.chunk(0).is_err());
+                        let output = std::io::Cursor::new(Bytes::new());
+                        let count = stream.copy_to(output)?;
+                        testing::assert(output.bytes().to_vec() == b"abcdef");
+                        testing::assert(stream.chunk(1)?.is_none());
+                        Result::Ok(count)
+                    },
+                ),
+                "exact cumulative limit succeeds",
+            );
+            testing::assert_eq(count, 6);
+            testing::expect_ok(
+                client.put_object(
+                    Context::background(),
+                    "bucket",
+                    "empty-stream",
+                    Bytes::new(),
+                    "text/plain",
+                ),
+                "put empty",
+            );
+            testing::expect_ok(
+                client.get_object_stream(
+                    Context::background(),
+                    "bucket",
+                    "empty-stream",
+                    |stream| {
+                        testing::assert(stream.content_length() == Option::Some(0));
+                        testing::assert(stream.chunk(1)?.is_none());
+                        Result::Ok(())
+                    },
+                ),
+                "empty download",
+            );
+        },
+    );
+}

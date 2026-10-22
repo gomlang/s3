@@ -135,7 +135,7 @@ impl Client {
         Result::Ok((self.scheme + "://" + host + uri_encode(path, true), host, path))
     }
 
-    fn send(
+    fn signed_request(
         self: Client,
         context: Context,
         method: string,
@@ -144,8 +144,7 @@ impl Client {
         query: Vec[(string, string)],
         headers: request::Headers,
         body: Bytes,
-        metadata: bool,
-    ) -> Result[request::Response, Error] {
+    ) -> Result[request::RequestBuilder, Error] {
         check_context(context)?;
         if body.len() > self.config.max_object_bytes {
             return Result::Err(error(ErrorKind::Limit, "S3 request body limit exceeded"))
@@ -176,16 +175,32 @@ impl Client {
             } else {
                 "?" + query_text
             };
+        Result::Ok(
+            self.transport.request(method, url).headers(signed.headers.remove("host")).body(body).redirect(
+                request::RedirectPolicy::None,
+            ),
+        )
+    }
+
+    fn send(
+        self: Client,
+        context: Context,
+        method: string,
+        bucket: string,
+        key: string,
+        query: Vec[(string, string)],
+        headers: request::Headers,
+        body: Bytes,
+        metadata: bool,
+    ) -> Result[request::Response, Error] {
         let limit = if metadata {
             self.config.max_metadata_bytes
         } else {
             self.config.max_object_bytes
         };
-        let response = self.transport.request(method, url).headers(signed.headers.remove("host")).body(
-            body,
-        ).body_limit(limit).redirect(request::RedirectPolicy::None).send_with(context).map_err(
-            transport_error,
-        )?;
+        let response = self.signed_request(context, method, bucket, key, query, headers, body)?.body_limit(
+            limit,
+        ).send_with(context).map_err(transport_error)?;
         if !response.status().is_success() {
             let mut code = "";
             if let Ok(document) = parse_document(response.bytes(), self.config.max_metadata_bytes) {

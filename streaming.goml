@@ -1,0 +1,208 @@
+package s3;
+
+use ecosystem::request;
+use std::bytes::{Bytes};
+use std::context::{Context};
+use std::io::{Write};
+
+struct DownloadState {
+    total: isize,
+    failure: Option[Error],
+}
+
+pub struct ObjectStream {
+    response: request::StreamingResponse,
+    state: Channel[DownloadState],
+    limit: isize,
+}
+
+impl ObjectStream {
+    pub fn content_length(self: ObjectStream) -> Option[isize] {
+        self.response.content_length()
+    }
+
+    pub fn headers(self: ObjectStream) -> request::Headers {
+        self.response.headers()
+    }
+
+    pub fn etag(self: ObjectStream) -> Option[string] {
+        self.headers().get("etag")
+    }
+
+    pub fn version_id(self: ObjectStream) -> Option[string] {
+        self.headers().get("x-amz-version-id")
+    }
+
+    pub fn content_type(self: ObjectStream) -> Option[string] {
+        self.headers().get("content-type")
+    }
+
+    pub fn read_bytes(self: ObjectStream, buffer: MutSlice[byte]) -> Result[isize, Error] {
+        let state = self.state.recv().unwrap_or(DownloadState { total: 0, failure: Option::None });
+        if let Some(failure) = state.failure {
+            self.state.send(state);
+            return Result::Err(failure)
+        }
+        let result = self.read_limited(buffer, state.total);
+        self.state.send(
+            match result {
+                Ok(count) => DownloadState { total: state.total + count, ..state },
+                Err(failure) => DownloadState { failure: Option::Some(failure), ..state },
+            },
+        );
+        result
+    }
+
+    fn read_limited(self: ObjectStream, buffer: MutSlice[byte], total: isize) -> Result[
+        isize,
+        Error,
+    ] {
+        if buffer.len() == 0 {
+            return self.response.read_bytes(buffer).map_err(transport_error)
+        }
+        let remaining = self.limit - total;
+        if remaining == 0 {
+            let probe: Vec[byte] = Vec::from_array([0]);
+            if self.response.read_bytes(probe.as_mut_slice()).map_err(transport_error)? != 0 {
+                return Result::Err(error(ErrorKind::Limit, "S3 body limit exceeded"))
+            }
+            return Result::Ok(0)
+        }
+        let count = if buffer.len() < remaining {
+            buffer.len()
+        } else {
+            remaining
+        };
+        self.response.read_bytes(buffer.sub(0, count)).map_err(transport_error)
+    }
+
+    pub fn chunk(self: ObjectStream, max_bytes: isize) -> Result[Option[Bytes], Error] {
+        if max_bytes < 1 || max_bytes > 1048576 {
+            return Result::Err(
+                error(ErrorKind::Configuration, "stream chunk size must be within 1..1048576"),
+            )
+        }
+        let buffer: Vec[byte] = Vec::with_capacity(max_bytes);
+        for _ in 0..max_bytes {
+            buffer.push(0);
+        }
+        let count = self.read_bytes(buffer.as_mut_slice())?;
+        if count == 0 {
+            return Result::Ok(Option::None)
+        }
+        buffer.truncate(count);
+        Result::Ok(Option::Some(Bytes::from_vec(buffer)))
+    }
+
+    pub fn copy_to[W: Write](self: ObjectStream, writer: W) -> Result[u64, Error] {
+        let mut total: u64 = 0;
+        loop {
+            match self.chunk(8192)? {
+                None => return Result::Ok(total),
+                Some(chunk) => {
+                    writer.write_all(chunk.to_vec().as_slice()).map_err(
+                        |_| error(ErrorKind::Transport, "S3 download writer failed"),
+                    )?;
+                    total += chunk.len().to_u64();
+                },
+            }
+        }
+    }
+
+    pub fn close(self: ObjectStream) -> () {
+        self.response.close()
+    }
+}
+
+impl Client {
+    pub fn get_object_stream[T](
+        self: Client,
+        context: Context,
+        bucket: string,
+        key: string,
+        consume: (ObjectStream) -> Result[T, Error],
+    ) -> Result[T, Error] {
+        validate_key(key)?;
+        let limit = if self.config.max_object_bytes > self.config.max_metadata_bytes {
+            self.config.max_object_bytes
+        } else {
+            self.config.max_metadata_bytes
+        };
+        let builder = self.signed_request(
+            context,
+            "GET",
+            bucket,
+            key,
+            Vec::new(),
+            request::Headers::new(),
+            Bytes::new(),
+        )?;
+        let receive: (request::StreamingResponse) -> Result[Result[T, Error], request::Error] = |
+            response,
+        | {
+            if response.status().is_success() {
+                if let Some(length) = response.content_length() {
+                    if length > self.config.max_object_bytes {
+                        return Result::Ok(
+                            Result::Err(error(ErrorKind::Limit, "S3 body limit exceeded")),
+                        )
+                    }
+                }
+                let state = Channel::new(1);
+                state.send(DownloadState { total: 0, failure: Option::None });
+                let stream = ObjectStream { response, state, limit: self.config.max_object_bytes };
+                let result = consume(stream);
+                stream.close();
+                let last = state.recv().unwrap_or(DownloadState { total: 0, failure: Option::None });
+                state.send(last);
+                if let Some(failure) = last.failure {
+                    return Result::Ok(Result::Err(failure))
+                }
+                return Result::Ok(result)
+            }
+            let bytes: Vec[byte] = Vec::new();
+            loop {
+                let remaining = self.config.max_metadata_bytes - bytes.len();
+                let count = if remaining < 8192 {
+                    remaining + 1
+                } else {
+                    8192
+                };
+                match response.chunk(count)? {
+                    None => break,
+                    Some(chunk) => {
+                        if chunk.len() > remaining {
+                            return Result::Ok(
+                                Result::Err(
+                                    error(ErrorKind::Limit, "S3 metadata body limit exceeded"),
+                                ),
+                            )
+                        }
+                        for value in chunk.to_vec() {
+                            bytes.push(value);
+                        }
+                    },
+                }
+            }
+            let mut code = "";
+            if let Ok(document) = parse_document(
+                Bytes::from_vec(bytes),
+                self.config.max_metadata_bytes,
+            ) {
+                if document.name == "Error" {
+                    code = safe_code(document.optional("Code").unwrap_or(""));
+                }
+            }
+            Result::Ok(
+                Result::Err(
+                    Error {
+                        status: response.status().as_isize(),
+                        code,
+                        ..error(ErrorKind::Service, "S3 service rejected request"),
+                    },
+                ),
+            )
+        };
+        builder.body_limit(limit).send_stream_with(context, receive).map_err(transport_error)?
+    }
+}
